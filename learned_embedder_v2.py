@@ -1,11 +1,10 @@
 """
-Improved deformation-augmented learned embedder (v2).
+Improved embedder: v1 architecture + v2 improvements.
 
-Changes from v1:
-- Stronger geometric augmentation: rot 15°→25°, elastic 0.06→0.10, added flips
-- Larger network: width 16→24 (3.6× more capacity)
-- Triplet loss with hard negative mining (instead of CLIP)
-- Configurable via the same env vars (backward compatible)
+Keep the proven CLIP loss from v1, but add:
+- Stronger geometric augmentation: rot 15°→25°, elastic 0.06→0.10, flips
+- Larger network: width 16→24
+- Learned temperature scale (like v1)
 """
 import os
 import math
@@ -39,7 +38,7 @@ def pick_device():
 
 
 class Encoder3D(nn.Module):
-    """3-D CNN with residual blocks: 96 → 48 → 24 → 12 → 6, global-pool → embedding."""
+    """3-D CNN: 96 → 48 → 24 → 12 → 6, global-pool → embedding."""
 
     def __init__(self, dim=128, width=24):
         super().__init__()
@@ -53,37 +52,24 @@ class Encoder3D(nn.Module):
                 nn.GroupNorm(g, co), nn.ReLU(inplace=True),
             )
 
-        self.stem = nn.Sequential(
-            nn.Conv3d(1, width, 3, stride=1, padding=1, bias=False),
-            nn.GroupNorm(1, width), nn.ReLU(inplace=True),
+        self.net = nn.Sequential(
+            block(1, width, 2),
+            block(width, width * 2, 2),
+            block(width * 2, width * 4, 2),
+            block(width * 4, width * 8, 2),
+            nn.AdaptiveAvgPool3d(1), nn.Flatten(),
+            nn.Linear(width * 8, dim),
         )
 
-        self.layer1 = block(width, width, 2)
-        self.layer2 = block(width, width * 2, 2)
-        self.layer3 = block(width * 2, width * 4, 2)
-        self.layer4 = block(width * 4, width * 8, 2)
-
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.fc = nn.Linear(width * 8, dim)
-
     def forward(self, x):
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        return x
+        return self.net(x)
 
 
-class TripletModel(nn.Module):
-    """Encoder + L2 normalization for triplet loss."""
-
+class CLIPModel(nn.Module):
     def __init__(self, dim=128, width=24):
         super().__init__()
         self.enc = Encoder3D(dim, width)
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
     def encode(self, x):
         return F.normalize(self.enc(x), dim=1)
@@ -103,7 +89,7 @@ def _rotation_matrices(B, max_deg, device):
 
 
 def _geom_augment(x, cfg):
-    """Independent rigid + elastic warp + random flip."""
+    """Independent rigid + elastic warp + random flip (stronger)."""
     B = x.shape[0]
     dev = x.device
     size = x.shape[2:]
@@ -116,9 +102,9 @@ def _geom_augment(x, cfg):
 
     # Rotation + scale
     R = _rotation_matrices(B, cfg["rot_deg"], dev)
-    scale = 1 + (torch.rand(B, 3, device=dev) * 2 - 1) * 0.15  # ± 15%
+    scale = 1 + (torch.rand(B, 3, device=dev) * 2 - 1) * 0.15
     R = R * scale[:, None, :]
-    trans = (torch.rand(B, 3, device=dev) * 2 - 1) * 0.15  # ± 15% translation
+    trans = (torch.rand(B, 3, device=dev) * 2 - 1) * 0.15
     theta = torch.cat([R, trans[:, :, None]], dim=2)
     grid = F.affine_grid(theta, (B, 1, *size), align_corners=False)
 
@@ -136,21 +122,21 @@ def _intensity_augment(x):
     dev = x.device
     mask = (x > 0.02).float()
 
-    # Gamma (wider range)
+    # Gamma (wider)
     gamma = torch.empty(B, 1, 1, 1, 1, device=dev).uniform_(0.5, 1.7)
     x = x.clamp(0, 1) ** gamma
 
-    # Contrast inversion (50%)
+    # Contrast inversion
     inv = (torch.rand(B, 1, 1, 1, 1, device=dev) < 0.5).float()
     x = (1 - inv) * x + inv * ((1.0 - x) * mask)
 
-    # Bias field (stronger)
+    # Bias field
     bias = F.interpolate(torch.randn(B, 1, 4, 4, 4, device=dev), size=x.shape[2:],
                          mode="trilinear", align_corners=False)
     bias = 0.6 + 0.8 * torch.sigmoid(bias)
     x = x * bias
 
-    # Noise (slightly stronger)
+    # Noise
     x = x + torch.randn_like(x) * 0.04
     x = (x * mask).clamp(0, None)
     m = x.amax(dim=(2, 3, 4), keepdim=True).clamp_min(1e-6)
@@ -167,33 +153,19 @@ def _load_stack(pairs, index, grid, loader, key, device):
     return torch.from_numpy(arr).to(device)
 
 
-def _contrastive_loss(z_q, z_t, scale=20.0):
-    """Improved contrastive loss: softmax over similarities with hard negatives.
-
-    Like CLIP but with a scaling factor for better gradient flow.
-    Positive: diagonals. Negatives: all off-diagonals.
-    """
-    sim = z_q @ z_t.t() * scale  # (B, B), scaled for numerical stability
-    labels = torch.arange(sim.shape[0], device=sim.device)
-
-    # Symmetric loss (query->target and target->query)
-    loss_qt = torch.nn.functional.cross_entropy(sim, labels)
-    loss_tq = torch.nn.functional.cross_entropy(sim.t(), labels)
-    return (loss_qt + loss_tq) / 2
-
-
 def build(pairs, index, grid, loader, device=None):
-    """Train the embedder on `pairs` and return an embed fn."""
+    """Train on `pairs` with stronger augmentation + larger network."""
     cfg = _cfg()
     device = torch.device(device or pick_device())
-    print(f"[learned_v2] device={device} pairs={len(pairs)} cfg={cfg}")
+    print(f"[learned_improved] device={device} pairs={len(pairs)} cfg={cfg}")
 
     q = _load_stack(pairs, index, grid, loader, "query_id", device)
     t = _load_stack(pairs, index, grid, loader, "target_id", device)
     N = len(pairs)
 
-    model = TripletModel(cfg["dim"], cfg["width"]).to(device)
+    model = CLIPModel(cfg["dim"], cfg["width"]).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    ce = nn.CrossEntropyLoss()
     model.train()
 
     t0 = time.time()
@@ -208,10 +180,12 @@ def build(pairs, index, grid, loader, device=None):
 
             qa = augment(q[idx], cfg)
             ta = augment(t[idx], cfg)
-            zq = model.encode(qa)
-            zt = model.encode(ta)
+            zq, zt = model.encode(qa), model.encode(ta)
 
-            loss = _contrastive_loss(zq, zt, scale=20.0)
+            scale = model.logit_scale.exp().clamp(max=100)
+            logits = scale * zq @ zt.t()
+            labels = torch.arange(len(idx), device=device)
+            loss = (ce(logits, labels) + ce(logits.t(), labels)) / 2
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -222,7 +196,7 @@ def build(pairs, index, grid, loader, device=None):
             seen += len(idx)
 
         if epoch % 25 == 0 or epoch == 1:
-            print(f"[learned_v2] epoch {epoch:03d} loss={total / max(seen,1):.4f} "
+            print(f"[learned_improved] epoch {epoch:03d} loss={total / max(seen,1):.4f} "
                   f"({time.time()-t0:.0f}s)")
 
     model.eval()
