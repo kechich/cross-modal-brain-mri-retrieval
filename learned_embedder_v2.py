@@ -27,7 +27,6 @@ def _cfg():
         rot_deg=float(os.environ.get("EMB_ROT", "25")),  # ← 15→25
         elastic=float(os.environ.get("EMB_ELASTIC", "0.10")),  # ← 0.06→0.10
         weight_decay=float(os.environ.get("EMB_WD", "1e-2")),
-        margin=float(os.environ.get("EMB_MARGIN", "0.2")),  # triplet margin
     )
 
 
@@ -168,25 +167,19 @@ def _load_stack(pairs, index, grid, loader, key, device):
     return torch.from_numpy(arr).to(device)
 
 
-def _triplet_loss_with_mining(z_q, z_t, margin=0.2):
-    """Triplet loss with hard negative mining.
+def _contrastive_loss(z_q, z_t, scale=20.0):
+    """Improved contrastive loss: softmax over similarities with hard negatives.
 
-    For each query, the target is positive. All other targets are negatives.
-    Find hardest negatives (highest similarity) and use those.
+    Like CLIP but with a scaling factor for better gradient flow.
+    Positive: diagonals. Negatives: all off-diagonals.
     """
-    sim = z_q @ z_t.t()  # (B, B)
-    B = sim.shape[0]
+    sim = z_q @ z_t.t() * scale  # (B, B), scaled for numerical stability
+    labels = torch.arange(sim.shape[0], device=sim.device)
 
-    pos_sim = torch.diagonal(sim)  # (B,)
-
-    # For each sample, find hardest negative (max similarity among off-diagonals)
-    # Mask out the diagonal
-    mask = 1 - torch.eye(B, device=sim.device)
-    masked_sim = sim * mask + (-1e9) * (1 - mask)
-    neg_sim, _ = torch.max(masked_sim, dim=1)  # (B,)
-
-    loss = torch.clamp(neg_sim - pos_sim + margin, min=0).mean()
-    return loss
+    # Symmetric loss (query->target and target->query)
+    loss_qt = torch.nn.functional.cross_entropy(sim, labels)
+    loss_tq = torch.nn.functional.cross_entropy(sim.t(), labels)
+    return (loss_qt + loss_tq) / 2
 
 
 def build(pairs, index, grid, loader, device=None):
@@ -218,7 +211,7 @@ def build(pairs, index, grid, loader, device=None):
             zq = model.encode(qa)
             zt = model.encode(ta)
 
-            loss = _triplet_loss_with_mining(zq, zt, cfg["margin"])
+            loss = _contrastive_loss(zq, zt, scale=20.0)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
