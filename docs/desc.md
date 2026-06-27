@@ -12,7 +12,7 @@ You need to fork the official GitHub repo, follow its guide and submit your solu
 
 Prize
 
-500
+500€
 
 Submission Requirements
 Pitch DeckGitHub RepositoryLive Demo

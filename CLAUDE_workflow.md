@@ -7,78 +7,65 @@ Fast iteration loop: Claude codes locally (captured by `entire`), uploads to the
 1. **You:** Prompt Claude in terminal (e.g., "run the baseline")
 2. **Claude:** 
    - Writes/edits code locally (captured by `entire` for grading)
-   - Uploads to Jupyter via `tools/jupyter_api.py`
+   - Uploads to Jupyter via `tools/jupyter_put.py`
    - Provides instructions for running in JupyterLab
 3. **You:** Execute the notebook/script in JupyterLab (Run All)
-4. **Claude:** Downloads results and reads them back into our conversation
+4. **Claude:** Downloads results and reads them back
 5. **Repeat:** Loop back to step 1
 
 ## Jupyter Box Details
 
 | | |
 |---|---|
-| **URL** | `http://165.245.141.178/lab` (Jupyter token in credentials) |
-| **File root** | `/shared-docker` (Claude uploads here; visible in file browser) |
+| **URL** | `http://165.245.141.178/lab` |
+| **File root** | `/shared-docker` (uploads land here; visible in file browser) |
 | **Data** | `/workspace/data/ehl` (1454 `.nii` files + CSVs) |
 | **Output** | `/workspace/out` (training checkpoints, submissions, logs) |
-| **Environment** | ROCm torch (AMD GPU support), Python 3.x, docker container |
+| **Env** | ROCm torch, Python 3.x, docker container |
 
 ## File Upload/Download
 
-**Upload (Claude does this):**
+**Upload a file to Jupyter:**
 ```bash
-python tools/jupyter_api.py upload <local_file> [<jupyter_path>]
+python tools/jupyter_put.py <local_file> [<remote_path>]
+
 # Examples:
-python tools/jupyter_api.py upload kaggle_baseline.py              # → /shared-docker/kaggle_baseline.py
-python tools/jupyter_api.py upload run_training.ipynb notebooks/  # → /shared-docker/notebooks/run_training.ipynb
+python tools/jupyter_put.py kaggle_baseline.py                # lands in /shared-docker/
+python tools/jupyter_put.py run_training.ipynb amine/training.ipynb  # lands in /shared-docker/amine/
 ```
 
-**Download (Claude does this):**
+**Manage files on server (no SSH needed):**
 ```bash
-python tools/jupyter_api.py download <jupyter_file> [<local_path>]
-# Example:
-python tools/jupyter_api.py download /workspace/out/submission.csv  # → ./submission.csv
-```
-
-**List files (Claude does this):**
-```bash
-python tools/jupyter_api.py ls [<jupyter_path>]
-# Example:
-python tools/jupyter_api.py ls  # List /shared-docker
-python tools/jupyter_api.py ls /workspace/out  # List outputs
+python tools/jupyter_fs.py ls [<dir>]       # list directory
+python tools/jupyter_fs.py mkdir <dir>      # create directory
+python tools/jupyter_fs.py mv <old> <new>   # move/rename
 ```
 
 ## Single-Source-of-Truth Scripts
 
-All training/eval scripts auto-detect their environment and pick paths accordingly:
+All training/eval scripts auto-detect their environment:
 
-- **AMD / Jupyter run:** Script detects `/workspace/data/ehl` exists → uses it; outputs to `/workspace/out`
-- **Kaggle run:** Script detects Kaggle paths → uses `/kaggle/input` + `/kaggle/working`
+- **AMD / Jupyter:** Script detects `/workspace/data/ehl` → uses it; outputs to `/workspace/out`
+- **Kaggle:** Script detects Kaggle paths → uses `/kaggle/input` + `/kaggle/working`
 
-This means **no divergence** — same code, different environment detection.
+Same code, different paths. No divergence.
 
-### Example: `kaggle_baseline.py`
-- Self-contained, one file
-- On Jupyter: uses `/workspace/data/ehl`
-- On Kaggle: uses `/kaggle/input`, auto-pip-installs MONAI
-- Writes `submission.csv` to current working directory
+## Example Workflow
 
-## Workflow in Practice
-
-**Session start:**
-1. You: *"Let's run the baseline and see where we are."*
-2. Claude: 
-   - Checks `kaggle_baseline.py`
-   - Uploads it to Jupyter
-   - Says: *"Uploaded to `/shared-docker/kaggle_baseline.py`. In JupyterLab: File → Open → kaggle_baseline.py → Run All"*
-3. You: Open notebook in JupyterLab, click Run All, wait for results
-4. Claude: Downloads `/workspace/out/submission.csv` + logs, reads them, shows metrics
-5. You: *"Now add deformation augmentation to the training loop"*
-6. Claude: Edits `kaggle_baseline.py`, uploads new version, you run again
+**Running the baseline:**
+1. You: *"Run the baseline on the AMD box"*
+2. Claude:
+   ```bash
+   python tools/jupyter_put.py kaggle_baseline.py
+   ```
+   Then: *"Uploaded. In JupyterLab: open `kaggle_baseline.py` → Run All"*
+3. You: Open in JupyterLab, Run All
+4. Claude: Reads results from `/workspace/out/`, shows metrics
+5. Iterate: edit code locally → upload → run → analyze
 
 ## Notebooks vs Scripts
 
-- **Scripts** (`.py`): Upload, then run in JupyterLab's terminal or as a notebook cell (`!python <script>`)
-- **Notebooks** (`.ipynb`): Upload, then open in JupyterLab and Run All
+- **`.py` scripts:** Upload → run in JupyterLab terminal or notebook cell (`!python file.py`)
+- **`.ipynb` notebooks:** Upload → open in JupyterLab → Run All
 
-Claude can generate either; you pick based on what's easier to run/monitor.
+Claude handles both; you pick based on what's easier to run/monitor.
