@@ -20,6 +20,7 @@ Tunables via env: EMB_EPOCHS, EMB_BATCH, EMB_DIM, EMB_WIDTH, EMB_LR, EMB_ROT, EM
 import os
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -29,12 +30,17 @@ import torch.nn.functional as F
 
 # --------------------------------------------------------------------------- config
 def _cfg():
+    # backbone: "cnn" (from-scratch, fast) or "swin" (MONAI SwinUNETR, SSL-pretrained)
+    swin = os.environ.get("EMB_BACKBONE", "cnn") == "swin"
     return dict(
-        epochs=int(os.environ.get("EMB_EPOCHS", "300")),
-        batch=int(os.environ.get("EMB_BATCH", "96")),
+        backbone="swin" if swin else "cnn",
+        epochs=int(os.environ.get("EMB_EPOCHS", "80" if swin else "300")),
+        batch=int(os.environ.get("EMB_BATCH", "48" if swin else "96")),
         dim=int(os.environ.get("EMB_DIM", "128")),
         width=int(os.environ.get("EMB_WIDTH", "16")),
-        lr=float(os.environ.get("EMB_LR", "3e-4")),
+        lr=float(os.environ.get("EMB_LR", "2e-4" if swin else "3e-4")),       # backbone lr
+        lr_head=float(os.environ.get("EMB_LR_HEAD", "1e-3")),                  # new-head lr
+        swin_checkpoint=os.environ.get("EMB_SWIN_CHECKPOINT", "0") == "1",     # 192GB -> off
         rot_deg=float(os.environ.get("EMB_ROT", "15")),
         elastic=float(os.environ.get("EMB_ELASTIC", "0.06")),
         weight_decay=float(os.environ.get("EMB_WD", "1e-2")),
@@ -78,10 +84,66 @@ class Encoder3D(nn.Module):
         return self.net(x)
 
 
-class CLIPModel(nn.Module):
-    def __init__(self, dim=128, width=16):
+# SSL-pretrained Swin UNETR encoder weights (self-supervised on ~5k 3D CT/MRI volumes).
+SSL_URL = ("https://github.com/Project-MONAI/MONAI-extra-test-data/releases/download/"
+           "0.8.1/model_swinvit.pt")
+
+
+def _ensure_swin_weights():
+    path = Path(os.environ.get("SWIN_WEIGHTS", "model_swinvit.pt"))
+    if not path.exists():
+        import urllib.request
+        print(f"[swin] downloading SSL weights -> {path}")
+        urllib.request.urlretrieve(SSL_URL, path)
+    return path
+
+
+class SwinEmbed(nn.Module):
+    """MONAI SwinUNETR swinViT backbone (SSL-pretrained) -> global-pool -> projection."""
+
+    def __init__(self, dim, grid, feature_size=48):
         super().__init__()
-        self.enc = Encoder3D(dim, width)
+        from monai.networks.nets import SwinUNETR
+        kw = dict(in_channels=1, out_channels=1, feature_size=feature_size, use_checkpoint=True)
+        try:
+            net = SwinUNETR(img_size=(grid,) * 3, spatial_dims=3, **kw)
+        except TypeError:                       # newer MONAI dropped img_size
+            net = SwinUNETR(spatial_dims=3, **kw)
+        ckpt = torch.load(_ensure_swin_weights(), map_location="cpu")
+        try:
+            net.load_from(weights=ckpt)
+            print("[swin] SSL weights loaded via load_from")
+        except Exception as e:                  # fallback: load straight into swinViT
+            sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+            sd = {k.split("swinViT.")[-1].replace("module.", ""): v for k, v in sd.items()}
+            m, u = net.swinViT.load_state_dict(sd, strict=False)
+            print(f"[swin] load_from failed ({type(e).__name__}); direct load "
+                  f"missing={len(m)} unexpected={len(u)}")
+        self.swin = net.swinViT
+        with torch.no_grad():                   # infer deepest-feature channel count
+            c = self._feat(torch.zeros(1, 1, grid, grid, grid)).shape[1]
+        self.head = nn.Sequential(nn.AdaptiveAvgPool3d(1), nn.Flatten(), nn.Linear(c, dim))
+
+    def _feat(self, x):
+        out = self.swin(x)
+        return out[-1] if isinstance(out, (list, tuple)) else out
+
+    def forward(self, x):
+        return self.head(self._feat(x))
+
+
+def make_encoder(cfg, grid):
+    if cfg["backbone"] == "swin":
+        if grid % 32 != 0:
+            raise ValueError(f"Swin needs GRID divisible by 32 (got {grid}; use 96)")
+        return SwinEmbed(cfg["dim"], grid)
+    return Encoder3D(cfg["dim"], cfg["width"])
+
+
+class CLIPModel(nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.enc = encoder
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
     def encode(self, x):
@@ -165,7 +227,7 @@ def build(pairs, index, grid, loader, device=None):
     t = _load_stack(pairs, index, grid, loader, "target_id", device)
     N = len(pairs)
 
-    model = CLIPModel(cfg["dim"], cfg["width"]).to(device)
+    model = CLIPModel(make_encoder(cfg, grid)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     ce = nn.CrossEntropyLoss()
     model.train()

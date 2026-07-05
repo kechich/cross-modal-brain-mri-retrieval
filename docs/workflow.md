@@ -17,7 +17,7 @@ Fast iteration loop: Claude codes locally (captured by `entire`), uploads to the
 
 | | |
 |---|---|
-| **URL** | `http://165.245.141.178/lab` |
+| **URL** | `http://<JUPYTER_HOST>/lab` (set `JUPYTER_HOST` / `JUPYTER_TOKEN` in `.env`; see `.example.env`) |
 | **File root** | `/shared-docker` (uploads land here; visible in file browser) |
 | **Data** | `/workspace/data/ehl` (1454 `.nii` files + CSVs) |
 | **Output** | `/workspace/out` (training checkpoints, submissions, logs) |
