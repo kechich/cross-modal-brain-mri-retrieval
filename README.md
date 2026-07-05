@@ -7,7 +7,7 @@ Built for the **EHL Paris 2026 Hackathon** — *Cross-modal Content-based Retrie
 Images* track (Inria / Paris Brain Institute / PRAIRIE). Content-based retrieval lets clinicians
 find related cases directly from image appearance rather than metadata.
 
-**Best result: `0.703` macro-MRR** on the Kaggle leaderboard (baseline: `0.455`), using a
+**Best result: `0.862` macro-MRR** on the Kaggle leaderboard (baseline: `0.455`), using a
 **training-free MIND-descriptor** method — no learned model in the winning path.
 
 ---
